@@ -1,0 +1,216 @@
+const int COLS = 8;
+const int ROWS = 8;
+const int PADDLE_WIDTH = 3;
+const unsigned long FRAME_MS = 50;
+
+VL53L0X_mod sensor;
+Adafruit_NeoPixel pixels(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+int paddleX = 2;
+float paddleX_f = 2.0;
+
+float ballX = 3.5, ballY = 2.0;
+float velX = 0.4, velY = 0.4;
+bool ballInPlay = false;
+
+volatile bool serveRequested = false;
+unsigned long lastSoundInterrupt = 0;
+const unsigned long SOUND_DEBOUNCE_MS = 150;
+
+// helper for mapping distance -> paddleX (since im too lazy to fuck with the Helpers.ino file)
+int distanceToPaddleX(int dist) {
+  // clamp
+  if (dist < MIN_DISTANCE) dist = MIN_DISTANCE;
+  if (dist > MAX_DISTANCE) dist = MAX_DISTANCE;
+  // normalize and invert so NEAR (small dist) -> RIGHT
+  float t = float(dist - MIN_DISTANCE) / float(MAX_DISTANCE - MIN_DISTANCE);
+  t = constrain(t, 0.0, 1.0);
+  t = 1.0 - t; // invert: near => 1.0
+  // map to allowable left-most paddleX (0 .. COLS - PADDLE_WIDTH)
+  int maxLeft = COLS - PADDLE_WIDTH;
+  int px = round(t * maxLeft);
+  px = constrain(px, 0, maxLeft);
+  return px;
+}
+
+int xyToIndex(int x, int y) {
+ if (y % 2 == 0) {
+return y * COLS + x;
+  } else {
+ return y * COLS + (COLS - 1 - x);
+  }
+}
+
+void IRAM_ATTR onSoundISR() {
+  unsigned long t = millis();
+  if (t - lastSoundInterrupt < SOUND_DEBOUNCE_MS) return;
+  lastSoundInterrupt = t;
+  serveRequested = true;
+}
+
+void resetBall() {
+  ballX = 3.5;
+  ballY = 2.0;
+  velX = (random(0, 2) == 0) ? 0.3 : -0.3;
+  velY = 0.4;
+  ballInPlay = false;
+}
+
+void serveBall() {
+  if (!ballInPlay) {
+  velY = -abs(velY);
+  velX = (random(-2, 3) / 5.0); // -0.4 .. 0.4
+    ballInPlay = true;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+// init sensor
+  Wire.begin();
+  if (!sensor.init()) {
+    Serial.println(F("VL53L0X init failed!"));
+  } else {
+    sensor.setTimeout(200);
+    sensor.startContinuous();
+  }
+
+  // pixels
+  pixels.begin();
+  pixels.setBrightness(BRIGHTNESS);
+  pixels.show(); // clear
+
+  // button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // sound sensor interrupt
+  pinMode(SOUND_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(SOUND_PIN), onSoundISR, RISING);
+
+  randomSeed(analogRead(28)); // seed random from floating pin
+
+  resetBall();
+}
+
+unsigned long lastFrame = 0;
+int lastDistance = MAX_DISTANCE;
+
+void drawFrame() {
+
+for (int i = 0; i < NUM_LEDS; ++i) pixels.setPixelColor(i, 0);
+
+int py = ROWS - 1;
+  for (int i = 0; i < PADDLE_WIDTH; ++i) {
+    int x = paddleX + i;
+    if (x >= 0 && x < COLS) {
+      pixels.setPixelColor(xyToIndex(x, py), pixels.Color(0, 50, 0));
+    }
+  }
+
+  int bx = round(ballX);
+  int by = round(ballY);
+  if (bx >= 0 && bx < COLS && by >= 0 && by < ROWS) {
+    pixels.setPixelColor(xyToIndex(bx, by), pixels.Color(50, 10, 0));
+  }
+
+pixels.show();
+}
+
+void updateBall() {
+  if (!ballInPlay) return;
+
+// iss point ke aage GPT hai
+// advance
+  ballX += velX;
+  ballY += velY;
+
+  // walls left/right
+  if (ballX < 0) {
+    ballX = 0;
+    velX = -velX;
+  } else if (ballX > COLS - 1) {
+    ballX = COLS - 1;
+    velX = -velX;
+  }
+
+  // top bounce
+  if (ballY < 0) {
+    ballY = 0;
+    velY = -velY;
+  }
+
+  // bottom (paddle or miss)
+  if (ballY >= ROWS - 1) {
+    // check paddle collision
+    int bx = round(ballX);
+    if (bx >= paddleX && bx < paddleX + PADDLE_WIDTH) {
+      // reflect up
+      ballY = ROWS - 2;
+      velY = -abs(velY) - 0.02; // slightly speed up
+      // add small horizontal change depending on where it hit the paddle
+      float hitPos = (float(bx) - (paddleX + (PADDLE_WIDTH - 1) / 2.0)); // -1..1
+      velX += hitPos * 0.12;
+      // clamp velX
+      velX = constrain(velX, -1.2, 1.2);
+    } else {
+      // missed: reset
+      // flash red to indicate miss
+      for (int f = 0; f < 2; ++f) {
+        for (int i = 0; i < NUM_LEDS; ++i) pixels.setPixelColor(i, pixels.Color(40, 0, 0));
+        pixels.show();
+        delay(80);
+        for (int i = 0; i < NUM_LEDS; ++i) pixels.setPixelColor(i, 0);
+        pixels.show();
+        delay(80);
+      }
+      resetBall();
+    }
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+  // read distance sensor periodically - we will sample every frame
+  int dist = MAX_DISTANCE;
+  if (!sensor.timeoutOccurred()) {
+    int r = sensor.readRangeContinuousMillimeters();
+    if (!sensor.timeoutOccurred()) {
+      dist = r;
+    }
+  }
+
+  // map to target paddle X and smooth it
+  int targetPX = distanceToPaddleX(dist);
+  // smooth movement (lerp)
+  paddleX_f = paddleX_f * 0.7 + targetPX * 0.3;
+  paddleX = (int)round(paddleX_f);
+  paddleX = constrain(paddleX, 0, COLS - PADDLE_WIDTH);
+
+  // trigger serve if sound interrupt happened or button pressed
+  if (serveRequested) {
+    serveRequested = false;
+    serveBall();
+  }
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    // button press -> toggle serve/reset
+    if (!ballInPlay) serveBall();
+    delay(200); // simple debounce
+  }
+
+  // update ball with lower frequency (frame timing)
+  if (now - lastFrame >= FRAME_MS) {
+    lastFrame = now;
+
+    if (ballInPlay) {
+      updateBall();
+    }
+
+    // draw everything
+    drawFrame();
+  }
+
+  // small idle yield
+  delay(2);
+}
